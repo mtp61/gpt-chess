@@ -1,8 +1,12 @@
 import threading
 import random
+import os
+import json
 
+from dotenv import load_dotenv
 import berserk
 import chess
+import openai
 
 
 def board_str_unicode(board: chess.Board):
@@ -24,11 +28,67 @@ def board_str_unicode(board: chess.Board):
     return "".join(builder)
 
 
+def request_log_append(log_item):
+    with open('./request_log.json', 'r') as f:
+        log = json.load(f)
+    log.append(log_item)
+    with open('./request_log.json', 'w') as f:
+        json.dump(log, f)
+
+
+def get_random_move(board: chess.Board) -> chess.Move:
+    return random.choice(list(board.legal_moves))
+
+
+def get_model_move(board: chess.Board) -> chess.Move:
+    openai.api_key = os.getenv('OPENAI_API_KEY')
+
+    move_history = [m.uci() for m in board.move_stack]
+    legal_moves = [m.uci() for m in board.legal_moves]
+    prompt = 'You are a chess engine. Given move history:\n' + \
+        ', '.join(move_history) + '\n' + \
+        'And possible moves:\n' + \
+        ', '.join(legal_moves) + '\n' + \
+        'Output the move that maximizes the probability of winning.'
+
+    completion_params = {
+        'engine': 'text-davinci-003',
+        'prompt': prompt,
+        'temperature': 0.7,
+        'max_tokens': 64,
+        'top_p': 1.0,
+        'frequency_penalty': 0.0,
+        'presence_penalty': 0.0,
+    }
+    response = openai.Completion.create(**completion_params)
+    response_text = response['choices'][0]['text'].lower()
+    response_moves = [m for m in legal_moves if m in response_text]
+
+    request_log_append({
+        'completion_params': completion_params,
+        'response': response,
+        'response_moves': response_moves,
+    })
+
+    print(response_moves)  # TODO
+
+    if len(response_moves) == 0:
+        move = get_random_move(board)
+        print(f'Response contained no moves, made random move {move}')
+    elif len(response_moves) == 1:
+        move = chess.Move.from_uci(response_moves[0])
+        print(f'Response contained exactly one move {move}')
+    else:
+        move = chess.Move.from_uci(random.choice(response_moves))
+        print(f'Response contained moves {response_moves}, randomly chose move {move}')
+
+    return move
+
+
 class Game(threading.Thread):
     def __init__(self, client, event, **kwargs):
         super().__init__(**kwargs)
         self.game_id = event['game']['gameId']
-        self.board = chess.Board(event['game']['fen'])
         self.color = chess.WHITE if event['game']['color'] == 'white' else chess.BLACK
         self.opponent_id = event['game']['opponent']['id']
 
@@ -37,7 +97,7 @@ class Game(threading.Thread):
 
         color = event['game']['color']
         self.log(f'Starting game against {self.opponent_id} playing with color {color}')
-        self.make_move()
+        self.make_move(chess.Board(event['game']['fen']))
 
     def run(self):
         for event in self.stream:
@@ -53,39 +113,34 @@ class Game(threading.Thread):
                 self.handle_chat_line(event)
 
     def handle_state_change(self, event):
-        move = event['moves'].split(' ')[-1]
-        self.board.push_san(move)
+        board = chess.Board()
+        for move in event['moves'].split(' '):
+            board.push_san(move)
 
-        to_move = 'gpt-chess' if self.color == self.board.turn else 'Opponent'
-        self.log(f'{to_move} to move in position,\n{board_str_unicode(self.board)}\n')
-        # TODO: display board in color
-
-        self.make_move()
+        to_move = 'gpt-chess' if self.color == board.turn else 'Opponent'
+        self.log(f'{to_move} to move in position,\n{board_str_unicode(board)}\n')
+        self.make_move(board)
 
     def handle_chat_line(self, event):
-        pass  # TODO
+        pass
 
-    def make_move(self):
-        if self.color != self.board.turn:
+    def make_move(self, board: chess.Board):
+        if self.color != board.turn:
             return
 
-        # TODO: get move from model
+        # move = get_random_move(board)
+        move = get_model_move(board)
+        client.bots.make_move(self.game_id, move.uci())
 
-        move = random.choice(list(self.board.legal_moves))
-        client.bots.make_move(self.game_id, move)
-
-        self.log(f'Made random move {move.uci()}\n')
+        self.log(f'Made move {move.uci()}\n')
 
     def log(self, message):
         print(f'Game {self.game_id}: {message}')
 
 
 if __name__ == '__main__':
-    # setup client
-    with open('./lichess.token') as f:
-        token = f.read().strip()
-
-    session = berserk.TokenSession(token)
+    load_dotenv()
+    session = berserk.TokenSession(os.getenv('LICHESS_TOKEN'))
     client = berserk.Client(session)
 
     # handle events
@@ -93,8 +148,13 @@ if __name__ == '__main__':
         print(f'Client Event: {event}\n')
 
         if event['type'] == 'challenge':
-            if event['challenge']['challenger']['id'] == 'mtpink':  # TODO: accept all challenges
-                client.bots.accept_challenge(event['challenge']['id'])
+            # TODO: accept all challenges
+            challenge_id = event['challenge']['id']
+            challenger_id = event['challenge']['challenger']['id']
+            if challenger_id == 'mtpink':
+                client.bots.accept_challenge(challenge_id)
+            else:
+                client.bots.decline_challenge(challenge_id)
         elif event['type'] == 'gameStart':
             game = Game(client, event)
             game.start()

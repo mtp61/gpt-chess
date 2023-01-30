@@ -1,2 +1,4 @@
 berserk-downstream
 chess
+python-dotenv
+openai
